@@ -156,10 +156,9 @@ class ReplyWaiters(object):
     def put(self, msg_id, message_data):
         queue = self._queues.get(msg_id)
         if not queue:
-            LOG.warn('No calling threads waiting for msg_id : %(msg_id)s'
-                     ', message : %(data)s', {'msg_id': msg_id,
-                                              'data': message_data})
-            LOG.warn('_queues: %s', self._queues)
+            LOG.info('No calling threads waiting for msg_id : %s', msg_id)
+            LOG.debug(' queues: %(queues)s, message: %(message)',
+                      {'queues': self._queues, 'message': message_data})
         else:
             queue.put(message_data)
 
