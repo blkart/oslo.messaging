@@ -202,7 +202,7 @@ class ReplyWaiter(object):
     @staticmethod
     def _raise_timeout_exception(msg_id):
         raise messaging.MessagingTimeout(
-            'Timed out waiting for a reply to message ID %s' % msg_id)
+            'Timed out waiting for a reply to message ID %s.' % msg_id)
 
     def _process_reply(self, data):
         result = None
@@ -266,7 +266,8 @@ class ReplyWaiter(object):
         # have the first thread take responsibility for passing replies not
         # intended for itself to the appropriate thread.
         #
-        timer = rpc_common.DecayingTimer(duration=timeout).start()
+        timer = rpc_common.DecayingTimer(duration=timeout)
+        timer.start()
         final_reply = None
         while True:
             if self.conn_lock.acquire(False):
