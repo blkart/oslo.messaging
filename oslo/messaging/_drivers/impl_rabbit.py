@@ -453,7 +453,6 @@ class Connection(object):
         # max retry-interval = 30 seconds
         self.interval_max = 30
 
-        self._ssl_params = self._fetch_ssl_params()
         self._login_method = self.conf.rabbit_login_method
 
         if url.virtual_host is not None:
@@ -499,7 +498,8 @@ class Connection(object):
 
         self.channel = None
         self.connection = kombu.connection.Connection(
-            self._url, ssl=self._ssl_params, login_method=self._login_method,
+            self._url, ssl=self._fetch_ssl_params(),
+            login_method=self._login_method,
             failover_strategy="shuffle")
 
         LOG.info(_('Connecting to AMQP server on %(hostname)s:%(port)d'),
@@ -540,24 +540,26 @@ class Connection(object):
         """Handles fetching what ssl params should be used for the connection
         (if any).
         """
-        ssl_params = dict()
+        if self.conf.rabbit_use_ssl:
+            ssl_params = dict()
 
-        # http://docs.python.org/library/ssl.html - ssl.wrap_socket
-        if self.conf.kombu_ssl_version:
-            ssl_params['ssl_version'] = self.validate_ssl_version(
-                self.conf.kombu_ssl_version)
-        if self.conf.kombu_ssl_keyfile:
-            ssl_params['keyfile'] = self.conf.kombu_ssl_keyfile
-        if self.conf.kombu_ssl_certfile:
-            ssl_params['certfile'] = self.conf.kombu_ssl_certfile
-        if self.conf.kombu_ssl_ca_certs:
-            ssl_params['ca_certs'] = self.conf.kombu_ssl_ca_certs
-            # We might want to allow variations in the
-            # future with this?
-            ssl_params['cert_reqs'] = ssl.CERT_REQUIRED
+            # http://docs.python.org/library/ssl.html - ssl.wrap_socket
+            if self.conf.kombu_ssl_version:
+                ssl_params['ssl_version'] = self.validate_ssl_version(
+                    self.conf.kombu_ssl_version)
+            if self.conf.kombu_ssl_keyfile:
+                ssl_params['keyfile'] = self.conf.kombu_ssl_keyfile
+            if self.conf.kombu_ssl_certfile:
+                ssl_params['certfile'] = self.conf.kombu_ssl_certfile
+            if self.conf.kombu_ssl_ca_certs:
+                ssl_params['ca_certs'] = self.conf.kombu_ssl_ca_certs
+                # We might want to allow variations in the
+                # future with this?
+                ssl_params['cert_reqs'] = ssl.CERT_REQUIRED
 
-        # Return the extended behavior or just have the default behavior
-        return ssl_params or None
+            # Return the extended behavior or just have the default behavior
+            return ssl_params or True
+        return False
 
     def ensure(self, error_callback, method, retry=None,
                timeout_is_error=True):

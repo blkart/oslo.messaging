@@ -13,6 +13,7 @@
 #    under the License.
 
 import datetime
+import ssl
 import sys
 import threading
 import time
@@ -65,6 +66,39 @@ class TestRabbitDriverLoad(test_utils.BaseTestCase):
         transport = messaging.get_transport(self.conf)
         self.addCleanup(transport.cleanup)
         self.assertIsInstance(transport._driver, rabbit_driver.RabbitDriver)
+
+
+class TestRabbitDriverLoadSSL(test_utils.BaseTestCase):
+    scenarios = [
+        ('no_ssl', dict(options=dict(), expected=False)),
+        ('no_ssl_with_options', dict(options=dict(kombu_ssl_version='TLSv1'),
+                                     expected=False)),
+        ('just_ssl', dict(options=dict(rabbit_use_ssl=True),
+                          expected=True)),
+        ('ssl_with_options', dict(options=dict(rabbit_use_ssl=True,
+                                               kombu_ssl_version='TLSv1',
+                                               kombu_ssl_keyfile='foo',
+                                               kombu_ssl_certfile='bar',
+                                               kombu_ssl_ca_certs='foobar'),
+                                  expected=dict(ssl_version=3,
+                                                keyfile='foo',
+                                                certfile='bar',
+                                                ca_certs='foobar',
+                                                cert_reqs=ssl.CERT_REQUIRED))),
+    ]
+
+    @mock.patch('oslo.messaging._drivers.impl_rabbit.Connection.ensure')
+    @mock.patch('kombu.connection.Connection')
+    def test_driver_load(self, connection_klass, fake_ensure):
+        self.config(**self.options)
+        transport = messaging.get_transport(self.conf,
+                                            'kombu+memory:////')
+        self.addCleanup(transport.cleanup)
+
+        transport._driver._get_connection()
+        connection_klass.assert_called_once_with(
+            'memory:///', ssl=self.expected,
+            login_method='AMQPLAIN', failover_strategy="shuffle")
 
 
 class TestRabbitIterconsume(test_utils.BaseTestCase):
