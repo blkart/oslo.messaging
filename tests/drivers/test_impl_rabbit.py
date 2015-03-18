@@ -172,6 +172,19 @@ class TestRabbitIterconsume(test_utils.BaseTestCase):
 
         self.assertEqual(0, int(deadline - time.time()))
 
+    def test_connection_reset_always_succeed(self):
+        transport = messaging.get_transport(self.conf,
+                                            'kombu+memory:////')
+        self.addCleanup(transport.cleanup)
+        channel = mock.Mock()
+        conn = transport._driver._get_connection(amqp.PURPOSE_LISTEN
+                                                 ).connection
+        conn.connection.recoverable_channel_errors = (IOError,)
+        with mock.patch.object(conn.connection, 'channel',
+                               side_effect=[IOError, IOError, channel]):
+            conn.reset()
+            self.assertEqual(channel, conn.channel)
+
 
 class TestRabbitTransportURL(test_utils.BaseTestCase):
 
