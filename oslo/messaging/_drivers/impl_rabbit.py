@@ -893,6 +893,7 @@ class Connection(object):
                     except recoverable_errors as exc:
                         LOG.info(_("A recoverable connection/channel error "
                                    "occurs, try to reconnect: %s"), exc)
+                        self.ensure_connection()
                 except Exception:
                     LOG.exception(_("Unexpected error during heartbeart "
                                     "thread processing, retrying..."))

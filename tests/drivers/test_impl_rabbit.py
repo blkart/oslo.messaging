@@ -63,7 +63,10 @@ class TestHeartbeat(test_utils.BaseTestCase):
     @mock.patch('kombu.connection.Connection.heartbeat_check')
     @mock.patch('oslo.messaging._drivers.impl_rabbit.Connection.'
                 '_heartbeat_supported_and_enabled', return_value=True)
-    def _do_test_heartbeat_sent(self, fake_heartbeat_support, fake_heartbeat,
+    @mock.patch('oslo.messaging._drivers.impl_rabbit.Connection.'
+                'ensure_connection')
+    def _do_test_heartbeat_sent(self, fake_ensure_connection,
+                                fake_heartbeat_support, fake_heartbeat,
                                 fake_logger, heartbeat_side_effect=None,
                                 info=None):
 
@@ -80,6 +83,7 @@ class TestHeartbeat(test_utils.BaseTestCase):
                                             'kombu+memory:////')
         self.addCleanup(transport.cleanup)
         conn = transport._driver._get_connection()
+        conn.ensure(error_callback=None, method=lambda: True)
         event.wait()
         conn._heartbeat_stop()
 
@@ -87,8 +91,10 @@ class TestHeartbeat(test_utils.BaseTestCase):
         self.assertLess(0, fake_heartbeat.call_count)
 
         if not heartbeat_side_effect:
+            self.assertEqual(1, fake_ensure_connection.call_count)
             self.assertEqual(2, fake_logger.info.call_count)
         else:
+            self.assertEqual(2, fake_ensure_connection.call_count)
             self.assertEqual(3, fake_logger.info.call_count)
             self.assertIn(mock.call(info, mock.ANY),
                           fake_logger.info.mock_calls)
