@@ -773,6 +773,11 @@ class Connection(object):
             self.consumer_num = itertools.count(1)
             for consumer in self.consumers:
                 consumer.reconnect(new_channel)
+            msg = _('Connected to AMQP server on '
+                    '%(hostname)s:%(port)s') % {
+                        'hostname': self.connection.hostname,
+                        'port': self.connection.port}
+            LOG.info(msg)
 
         def execute_method(channel):
             self._set_current_channel(channel)
