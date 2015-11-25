@@ -615,9 +615,9 @@ class Connection(object):
                 # a protocol response.  (See paste link in LP888621)
                 # So, we check all exceptions for 'timeout' in them
                 # and try to reconnect in this case.
-                if 'timeout' not in six.text_type(ex):
-                    raise
                 e = ex
+                if 'timeout' not in six.text_type(e):
+                    raise
 
             log_info = {}
             log_info['err_str'] = e
@@ -715,16 +715,27 @@ class Connection(object):
     def iterconsume(self, limit=None, timeout=None):
         """Return an iterator that will consume from all queues/consumers."""
 
+        timer = rpc_common.DecayingTimer(duration=timeout)
+        timer.start()
+
+        def _raise_timeout(exc):
+            LOG.debug('Timed out waiting for RPC response: %s', exc)
+            raise rpc_common.Timeout()
+
         def _error_callback(exc):
-            if isinstance(exc, socket.timeout):
-                LOG.debug('Timed out waiting for RPC response: %s', exc)
-                raise rpc_common.Timeout()
-            else:
-                LOG.exception(_('Failed to consume message from queue: %s'),
-                              exc)
-                self.do_consume = True
+            timer.check_return(_raise_timeout, exc)
+            LOG.exception(_('Failed to consume message from queue: %s'),
+                          exc)
+            self.do_consume = True
 
         def _consume():
+            # NOTE(sileht): in case the acknowledgement or requeue of a
+            # message fail, the kombu transport can be disconnected
+            # In this case, we must redeclare our consumers, so raise
+            # a recoverable error to trigger the reconnection code.
+            if not self.connection.connected:
+                raise self.connection.recoverable_connection_errors[0]
+
             if self.do_consume:
                 queues_head = self.consumers[:-1]  # not fanout.
                 queues_tail = self.consumers[-1]  # fanout
@@ -732,7 +743,14 @@ class Connection(object):
                     queue.consume(nowait=True)
                 queues_tail.consume(nowait=False)
                 self.do_consume = False
-            return self.connection.drain_events(timeout=timeout)
+
+            poll_timeout = 1 if timeout is None else min(timeout, 1)
+            while True:
+                try:
+                    return self.connection.drain_events(timeout=poll_timeout)
+                except socket.timeout as exc:
+                    poll_timeout = timer.check_return(_raise_timeout, exc,
+                                                      maximum=1)
 
         for iteration in itertools.count(0):
             if limit and iteration >= limit:
