@@ -975,7 +975,7 @@ class ZmqDriver(base.BaseDriver):
 
         return listener
 
-    def listen_for_notifications(self, targets_and_priorities):
+    def listen_for_notifications(self, targets_and_priorities, pool):
         # NOTE(sileht): this listener implementation is limited
         # because zeromq doesn't support requeing message
         conn = create_connection(self.conf)

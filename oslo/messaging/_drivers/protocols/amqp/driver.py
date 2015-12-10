@@ -231,11 +231,9 @@ class ProtonDriver(base.BaseDriver):
 
         super(ProtonDriver, self).__init__(conf, url, default_exchange,
                                            allowed_remote_exmods)
-        # TODO(grs): handle authentication etc
-        hosts = [(h.hostname, h.port or 5672) for h in url.hosts]
 
         # Create a Controller that connects to the messaging service:
-        self._ctrl = controller.Controller(hosts, default_exchange, conf)
+        self._ctrl = controller.Controller(url.hosts, default_exchange, conf)
 
         # lazy connection setup - don't cause the controller to connect until
         # after the first messaging request:
@@ -306,8 +304,11 @@ class ProtonDriver(base.BaseDriver):
         return listener
 
     @_ensure_connect_called
-    def listen_for_notifications(self, targets_and_priorities):
+    def listen_for_notifications(self, targets_and_priorities, pool):
         LOG.debug("Listen for notifications %s", targets_and_priorities)
+        if pool:
+            raise NotImplementedError('"pool" not implemented by'
+                                      'this transport driver')
         listener = ProtonListener(self)
         for target, priority in targets_and_priorities:
             topic = '%s.%s' % (target.topic, priority)

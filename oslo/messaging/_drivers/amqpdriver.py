@@ -127,6 +127,10 @@ class AMQPListener(base.Listener):
             else:
                 self.conn.consume(limit=1)
 
+    def cleanup(self):
+        # Closes listener connection
+        self.conn.close()
+
 
 class ReplyWaiters(object):
 
@@ -152,10 +156,9 @@ class ReplyWaiters(object):
     def put(self, msg_id, message_data):
         queue = self._queues.get(msg_id)
         if not queue:
-            LOG.warn('No calling threads waiting for msg_id : %(msg_id)s'
-                     ', message : %(data)s', {'msg_id': msg_id,
-                                              'data': message_data})
-            LOG.warn('_queues: %s', self._queues)
+            LOG.info('No calling threads waiting for msg_id : %s', msg_id)
+            LOG.debug(' queues: %(queues)s, message: %(message)',
+                      {'queues': self._queues, 'message': message_data})
         else:
             queue.put(message_data)
 
@@ -427,7 +430,7 @@ class AMQPDriverBase(base.BaseDriver):
 
         return listener
 
-    def listen_for_notifications(self, targets_and_priorities):
+    def listen_for_notifications(self, targets_and_priorities, pool):
         conn = self._get_connection(pooled=False)
 
         listener = AMQPListener(self, conn)
@@ -435,7 +438,7 @@ class AMQPDriverBase(base.BaseDriver):
             conn.declare_topic_consumer(
                 exchange_name=self._get_exchange(target),
                 topic='%s.%s' % (target.topic, priority),
-                callback=listener)
+                callback=listener, queue_name=pool)
         return listener
 
     def cleanup(self):
