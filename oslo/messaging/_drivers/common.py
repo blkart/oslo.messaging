@@ -18,6 +18,7 @@
 import copy
 import logging
 import sys
+import time
 import traceback
 
 import six
@@ -26,6 +27,7 @@ from oslo import messaging
 from oslo.messaging import _utils as utils
 from oslo.messaging.openstack.common.gettextutils import _
 from oslo.messaging.openstack.common import jsonutils
+from oslo.utils import strutils
 
 LOG = logging.getLogger(__name__)
 
@@ -161,20 +163,7 @@ class Connection(object):
 
 def _safe_log(log_func, msg, msg_data):
     """Sanitizes the msg_data field before logging."""
-    SANITIZE = ['_context_auth_token', 'auth_token', 'new_pass']
-
-    def _fix_passwords(d):
-        """Sanitizes the password fields in the dictionary."""
-        for k in six.iterkeys(d):
-            if k.lower().find('password') != -1:
-                d[k] = '<SANITIZED>'
-            elif k.lower() in SANITIZE:
-                d[k] = '<SANITIZED>'
-            elif isinstance(d[k], dict):
-                _fix_passwords(d[k])
-        return d
-
-    return log_func(msg, _fix_passwords(copy.deepcopy(msg_data)))
+    return log_func(msg, strutils.mask_password(six.text_type(msg_data)))
 
 
 def serialize_remote_exception(failure_info, log_failure=True):
@@ -347,3 +336,28 @@ def deserialize_msg(msg):
     raw_msg = jsonutils.loads(msg[_MESSAGE_KEY])
 
     return raw_msg
+
+
+class DecayingTimer(object):
+    def __init__(self, duration=None):
+        self._duration = duration
+        self._ends_at = None
+
+    def start(self):
+        if self._duration is not None:
+            self._ends_at = time.time() + max(0, self._duration)
+
+    def check_return(self, timeout_callback=None, *args, **kwargs):
+        maximum = kwargs.pop('maximum', None)
+
+        if self._duration is None:
+            return None if maximum is None else maximum
+        if self._ends_at is None:
+            raise RuntimeError(_("Can not check/return a timeout from a timer"
+                               " that has not been started."))
+
+        left = self._ends_at - time.time()
+        if left <= 0 and timeout_callback is not None:
+            timeout_callback(*args, **kwargs)
+
+        return left if maximum is None else min(left, maximum)

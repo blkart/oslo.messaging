@@ -15,7 +15,6 @@
 import functools
 import itertools
 import logging
-import random
 import socket
 import ssl
 import time
@@ -24,8 +23,10 @@ import uuid
 import kombu
 import kombu.connection
 import kombu.entity
+import kombu.exceptions
 import kombu.messaging
 import six
+from six.moves.urllib import parse
 
 from oslo.config import cfg
 from oslo.messaging._drivers import amqp as rpc_amqp
@@ -34,6 +35,7 @@ from oslo.messaging._drivers import common as rpc_common
 from oslo.messaging import exceptions
 from oslo.messaging.openstack.common.gettextutils import _
 from oslo.utils import netutils
+
 
 rabbit_opts = [
     cfg.StrOpt('kombu_ssl_version',
@@ -99,10 +101,11 @@ rabbit_opts = [
                      'If you change this option, you must wipe the '
                      'RabbitMQ database.'),
 
-    # FIXME(markmc): this was toplevel in openstack.common.rpc
+    # NOTE(sileht): deprecated option since oslo.messaging 1.5.0,
     cfg.BoolOpt('fake_rabbit',
                 default=False,
-                help='If passed, use a fake RabbitMQ provider.'),
+                help='Deprecated, use rpc_backend=kombu+memory or '
+                'rpc_backend=fake'),
 ]
 
 LOG = logging.getLogger(__name__)
@@ -159,7 +162,20 @@ class ConsumerBase(object):
         self.channel = channel
         self.kwargs['channel'] = channel
         self.queue = kombu.entity.Queue(**self.kwargs)
-        self.queue.declare()
+        try:
+            self.queue.declare()
+        except Exception as e:
+            # NOTE: This exception may be triggered by a race condition.
+            # Simply retrying will solve the error most of the time and
+            # should work well enough as a workaround until the race condition
+            # itself can be fixed.
+            # TODO(jrosenboom): In order to be able to match the Execption
+            # more specifically, we have to refactor ConsumerBase to use
+            # 'channel_errors' of the kombu connection object that
+            # has created the channel.
+            # See https://bugs.launchpad.net/neutron/+bug/1318721 for details.
+            LOG.exception(_("Declaring queue failed with (%s), retrying"), e)
+            self.queue.declare()
 
     def _callback_handler(self, message, callback):
         """Call callback with deserialized message.
@@ -354,7 +370,8 @@ class DirectPublisher(Publisher):
 
         options = {'durable': False,
                    'auto_delete': True,
-                   'exclusive': False}
+                   'exclusive': False,
+                   'passive': True}
         options.update(kwargs)
         super(DirectPublisher, self).__init__(channel, topic, topic,
                                               type='direct', **options)
@@ -370,6 +387,7 @@ class TopicPublisher(Publisher):
         options = {'durable': conf.amqp_durable_queues,
                    'auto_delete': conf.amqp_auto_delete,
                    'exclusive': False}
+
         options.update(kwargs)
         super(TopicPublisher, self).__init__(channel,
                                              exchange_name,
@@ -424,6 +442,7 @@ class Connection(object):
 
     def __init__(self, conf, url):
         self.consumers = []
+        self.consumer_num = itertools.count(1)
         self.conf = conf
         self.max_retries = self.conf.rabbit_max_retries
         # Try forever?
@@ -433,62 +452,75 @@ class Connection(object):
         self.interval_stepping = self.conf.rabbit_retry_backoff
         # max retry-interval = 30 seconds
         self.interval_max = 30
-        self.memory_transport = False
 
-        ssl_params = self._fetch_ssl_params()
+        self._login_method = self.conf.rabbit_login_method
 
         if url.virtual_host is not None:
             virtual_host = url.virtual_host
         else:
             virtual_host = self.conf.rabbit_virtual_host
 
-        self.brokers_params = []
-        if url.hosts:
+        self._url = ''
+        if self.conf.fake_rabbit:
+            LOG.warn("Deprecated: fake_rabbit option is deprecated, set "
+                     "rpc_backend to kombu+memory or use the fake "
+                     "driver instead.")
+            self._url = 'memory://%s/' % virtual_host
+        elif url.hosts:
             for host in url.hosts:
-                params = {
-                    'hostname': host.hostname,
-                    'port': host.port or 5672,
-                    'userid': host.username or '',
-                    'password': host.password or '',
-                    'login_method': self.conf.rabbit_login_method,
-                    'virtual_host': virtual_host
-                }
-                if self.conf.fake_rabbit:
-                    params['transport'] = 'memory'
-                if self.conf.rabbit_use_ssl:
-                    params['ssl'] = ssl_params
-
-                self.brokers_params.append(params)
+                transport = url.transport.replace('kombu+', '')
+                transport = url.transport.replace('rabbit', 'amqp')
+                self._url += '%s%s://%s:%s@%s:%s/%s' % (
+                    ";" if self._url else '',
+                    transport,
+                    parse.quote(host.username or ''),
+                    parse.quote(host.password or ''),
+                    host.hostname or '', str(host.port or 5672),
+                    virtual_host)
+        elif url.transport.startswith('kombu+'):
+            # NOTE(sileht): url have a + but no hosts
+            # (like kombu+memory:///), pass it to kombu as-is
+            transport = url.transport.replace('kombu+', '')
+            self._url = "%s://%s" % (transport, virtual_host)
         else:
-            # Old configuration format
             for adr in self.conf.rabbit_hosts:
                 hostname, port = netutils.parse_host_port(
                     adr, default_port=self.conf.rabbit_port)
+                self._url += '%samqp://%s:%s@%s:%s/%s' % (
+                    ";" if self._url else '',
+                    parse.quote(self.conf.rabbit_userid),
+                    parse.quote(self.conf.rabbit_password),
+                    hostname, port,
+                    virtual_host)
 
-                params = {
-                    'hostname': hostname,
-                    'port': port,
-                    'userid': self.conf.rabbit_userid,
-                    'password': self.conf.rabbit_password,
-                    'login_method': self.conf.rabbit_login_method,
-                    'virtual_host': virtual_host
-                }
+        self.do_consume = True
+        self._consume_loop_stopped = False
 
-                if self.conf.fake_rabbit:
-                    params['transport'] = 'memory'
-                if self.conf.rabbit_use_ssl:
-                    params['ssl'] = ssl_params
+        self.channel = None
+        self.connection = kombu.connection.Connection(
+            self._url, ssl=self._fetch_ssl_params(),
+            login_method=self._login_method,
+            failover_strategy="shuffle")
 
-                self.brokers_params.append(params)
+        LOG.info(_('Connecting to AMQP server on %(hostname)s:%(port)d'),
+                 {'hostname': self.connection.hostname,
+                  'port': self.connection.port})
+        # NOTE(sileht): just ensure the connection is setuped at startup
+        self.ensure(error_callback=None,
+                    method=lambda: True)
+        LOG.info(_('Connected to AMQP server on %(hostname)s:%(port)d'),
+                 {'hostname': self.connection.hostname,
+                  'port': self.connection.port})
 
-        random.shuffle(self.brokers_params)
-        self.brokers = itertools.cycle(self.brokers_params)
+        # NOTE(sileht):
+        # value choosen according the best practice from kombu:
+        # http://kombu.readthedocs.org/en/latest/reference/kombu.common.html#kombu.common.eventloop
+        self._poll_timeout = 1
 
-        self.memory_transport = self.conf.fake_rabbit
-
-        self.connection = None
-        self.do_consume = None
-        self.reconnect()
+        if self._url.startswith('memory://'):
+            # Kludge to speed up tests.
+            self.connection.transport.polling_interval = 0.0
+            self._poll_timeout = 0.05
 
     # FIXME(markmc): use oslo sslutils when it is available as a library
     _SSL_PROTOCOLS = {
@@ -514,185 +546,131 @@ class Connection(object):
         """Handles fetching what ssl params should be used for the connection
         (if any).
         """
-        ssl_params = dict()
+        if self.conf.rabbit_use_ssl:
+            ssl_params = dict()
 
-        # http://docs.python.org/library/ssl.html - ssl.wrap_socket
-        if self.conf.kombu_ssl_version:
-            ssl_params['ssl_version'] = self.validate_ssl_version(
-                self.conf.kombu_ssl_version)
-        if self.conf.kombu_ssl_keyfile:
-            ssl_params['keyfile'] = self.conf.kombu_ssl_keyfile
-        if self.conf.kombu_ssl_certfile:
-            ssl_params['certfile'] = self.conf.kombu_ssl_certfile
-        if self.conf.kombu_ssl_ca_certs:
-            ssl_params['ca_certs'] = self.conf.kombu_ssl_ca_certs
-            # We might want to allow variations in the
-            # future with this?
-            ssl_params['cert_reqs'] = ssl.CERT_REQUIRED
+            # http://docs.python.org/library/ssl.html - ssl.wrap_socket
+            if self.conf.kombu_ssl_version:
+                ssl_params['ssl_version'] = self.validate_ssl_version(
+                    self.conf.kombu_ssl_version)
+            if self.conf.kombu_ssl_keyfile:
+                ssl_params['keyfile'] = self.conf.kombu_ssl_keyfile
+            if self.conf.kombu_ssl_certfile:
+                ssl_params['certfile'] = self.conf.kombu_ssl_certfile
+            if self.conf.kombu_ssl_ca_certs:
+                ssl_params['ca_certs'] = self.conf.kombu_ssl_ca_certs
+                # We might want to allow variations in the
+                # future with this?
+                ssl_params['cert_reqs'] = ssl.CERT_REQUIRED
 
-        # Return the extended behavior or just have the default behavior
-        return ssl_params or True
+            # Return the extended behavior or just have the default behavior
+            return ssl_params or True
+        return False
 
-    def _connect(self, broker):
-        """Connect to rabbit.  Re-establish any queues that may have
-        been declared before if we are reconnecting.  Exceptions should
-        be handled by the caller.
+    def ensure(self, error_callback, method, retry=None,
+               timeout_is_error=True):
+        """Will retry up to retry number of times.
+        retry = None means use the value of rabbit_max_retries
+        retry = -1 means to retry forever
+        retry = 0 means no retry
+        retry = N means N retries
         """
-        LOG.info(_("Connecting to AMQP server on "
-                   "%(hostname)s:%(port)d"), broker)
-        self.connection = kombu.connection.BrokerConnection(**broker)
-        self.connection_errors = self.connection.connection_errors
-        self.channel_errors = self.connection.channel_errors
-        if self.memory_transport:
-            # Kludge to speed up tests.
-            self.connection.transport.polling_interval = 0.0
-        self.do_consume = True
-        self.consumer_num = itertools.count(1)
-        self.connection.connect()
-        self.channel = self.connection.channel()
-        # work around 'memory' transport bug in 1.1.3
-        if self.memory_transport:
-            self.channel._new_queue('ae.undeliver')
-        for consumer in self.consumers:
-            consumer.reconnect(self.channel)
-        LOG.info(_('Connected to AMQP server on %(hostname)s:%(port)d'),
-                 broker)
 
-    def _disconnect(self):
-        if self.connection:
+        if retry is None:
+            retry = self.max_retries
+        if retry is None or retry < 0:
+            retry = None
+
+        def on_error(exc, interval):
+            error_callback and error_callback(exc)
+
+            interval = (self.conf.kombu_reconnect_delay + interval
+                        if self.conf.kombu_reconnect_delay > 0 else interval)
+
+            info = {'hostname': self.connection.hostname,
+                    'port': self.connection.port,
+                    'err_str': exc, 'sleep_time': interval}
+
+            if 'Socket closed' in six.text_type(exc):
+                LOG.error(_('AMQP server %(hostname)s:%(port)s closed'
+                            ' the connection. Check login credentials:'
+                            ' %(err_str)s'), info)
+            else:
+                LOG.error(_('AMQP server on %(hostname)s:%(port)s is '
+                            'unreachable: %(err_str)s. Trying again in '
+                            '%(sleep_time)d seconds.'), info)
+
             # XXX(nic): when reconnecting to a RabbitMQ cluster
             # with mirrored queues in use, the attempt to release the
             # connection can hang "indefinitely" somewhere deep down
             # in Kombu.  Blocking the thread for a bit prior to
             # release seems to kludge around the problem where it is
             # otherwise reproduceable.
+            # TODO(sileht): Check if this is useful since we
+            # use kombu for HA connection, the interval_step
+            # should sufficient, because the underlying kombu transport
+            # connection object freed.
             if self.conf.kombu_reconnect_delay > 0:
-                LOG.info(_("Delaying reconnect for %1.1f seconds...") %
-                         self.conf.kombu_reconnect_delay)
                 time.sleep(self.conf.kombu_reconnect_delay)
 
-            try:
-                self.connection.release()
-            except self.connection_errors:
-                pass
-            self.connection = None
+        def on_reconnection(new_channel):
+            """Callback invoked when the kombu reconnects and creates
+            a new channel, we use it the reconfigure our consumers.
+            """
+            self._set_current_channel(new_channel)
+            self.consumer_num = itertools.count(1)
+            for consumer in self.consumers:
+                consumer.reconnect(new_channel)
 
-    def reconnect(self, retry=None):
-        """Handles reconnecting and re-establishing queues.
-        Will retry up to retry number of times.
-        retry = None means use the value of rabbit_max_retries
-        retry = -1 means to retry forever
-        retry = 0 means no retry
-        retry = N means N retries
-        Sleep between tries, starting at self.interval_start
-        seconds, backing off self.interval_stepping number of seconds
-        each attempt.
-        """
+        def execute_method(channel):
+            self._set_current_channel(channel)
+            method()
 
-        attempt = 0
-        loop_forever = False
-        if retry is None:
-            retry = self.max_retries
-        if retry is None or retry < 0:
-            loop_forever = True
+        recoverable_errors = (self.connection.recoverable_channel_errors +
+                              self.connection.recoverable_connection_errors)
+        try:
+            autoretry_method = self.connection.autoretry(
+                execute_method, channel=self.channel,
+                max_retries=retry,
+                errback=on_error,
+                interval_start=self.interval_start or 1,
+                interval_step=self.interval_stepping,
+                on_revive=on_reconnection,
+            )
+            ret, channel = autoretry_method()
+            self._set_current_channel(channel)
+            return ret
+        except recoverable_errors as exc:
+            self._set_current_channel(None)
+            # NOTE(sileht): number of retry exceeded and the connection
+            # is still broken
+            msg = _('Unable to connect to AMQP server on '
+                    '%(hostname)s:%(port)d after %(retry)s '
+                    'tries: %(err_str)s') % {
+                        'hostname': self.connection.hostname,
+                        'port': self.connection.port,
+                        'err_str': exc,
+                        'retry': retry}
+            LOG.error(msg)
+            raise exceptions.MessageDeliveryFailure(msg)
 
-        while True:
-            self._disconnect()
-
-            broker = six.next(self.brokers)
-            attempt += 1
-            try:
-                self._connect(broker)
-                return
-            except IOError as ex:
-                e = ex
-            except self.connection_errors as ex:
-                e = ex
-            except Exception as ex:
-                # NOTE(comstud): Unfortunately it's possible for amqplib
-                # to return an error not covered by its transport
-                # connection_errors in the case of a timeout waiting for
-                # a protocol response.  (See paste link in LP888621)
-                # So, we check all exceptions for 'timeout' in them
-                # and try to reconnect in this case.
-                if 'timeout' not in six.text_type(e):
-                    raise
-                e = ex
-
-            log_info = {}
-            log_info['err_str'] = e
-            log_info['retry'] = retry or 0
-            log_info.update(broker)
-
-            if not loop_forever and attempt > retry:
-                msg = _('Unable to connect to AMQP server on '
-                        '%(hostname)s:%(port)d after %(retry)d '
-                        'tries: %(err_str)s') % log_info
-                LOG.error(msg)
-                raise exceptions.MessageDeliveryFailure(msg)
-            else:
-                if attempt == 1:
-                    sleep_time = self.interval_start or 1
-                elif attempt > 1:
-                    sleep_time += self.interval_stepping
-
-                sleep_time = min(sleep_time, self.interval_max)
-
-                log_info['sleep_time'] = sleep_time
-                if 'Socket closed' in six.text_type(e):
-                    LOG.error(_('AMQP server %(hostname)s:%(port)d closed'
-                                ' the connection. Check login credentials:'
-                                ' %(err_str)s'), log_info)
-                else:
-                    LOG.error(_('AMQP server on %(hostname)s:%(port)d is '
-                                'unreachable: %(err_str)s. Trying again in '
-                                '%(sleep_time)d seconds.'), log_info)
-                time.sleep(sleep_time)
-
-    def ensure(self, error_callback, method, retry=None):
-        while True:
-            try:
-                return method()
-            except self.connection_errors as e:
-                if error_callback:
-                    error_callback(e)
-            except self.channel_errors as e:
-                if error_callback:
-                    error_callback(e)
-            except (socket.timeout, IOError) as e:
-                if error_callback:
-                    error_callback(e)
-            except Exception as e:
-                # NOTE(comstud): Unfortunately it's possible for amqplib
-                # to return an error not covered by its transport
-                # connection_errors in the case of a timeout waiting for
-                # a protocol response.  (See paste link in LP888621)
-                # So, we check all exceptions for 'timeout' in them
-                # and try to reconnect in this case.
-                if 'timeout' not in six.text_type(e):
-                    raise
-                if error_callback:
-                    error_callback(e)
-            self.reconnect(retry=retry)
-
-    def get_channel(self):
-        """Convenience call for bin/clear_rabbit_queues."""
-        return self.channel
+    def _set_current_channel(self, new_channel):
+        if self.channel is not None and new_channel != self.channel:
+            self.connection.maybe_close_channel(self.channel)
+        self.channel = new_channel
 
     def close(self):
         """Close/release this connection."""
         if self.connection:
+            self._set_current_channel(None)
             self.connection.release()
             self.connection = None
 
     def reset(self):
         """Reset a connection so it can be used again."""
-        self.channel.close()
-        self.channel = self.connection.channel()
-        # work around 'memory' transport bug in 1.1.3
-        if self.memory_transport:
-            self.channel._new_queue('ae.undeliver')
+        self._set_current_channel(self.connection.channel())
         self.consumers = []
+        self.consumer_num = itertools.count(1)
 
     def declare_consumer(self, consumer_cls, topic, callback):
         """Create a Consumer using the class that was passed in and
@@ -715,14 +693,18 @@ class Connection(object):
     def iterconsume(self, limit=None, timeout=None):
         """Return an iterator that will consume from all queues/consumers."""
 
+        timer = rpc_common.DecayingTimer(duration=timeout)
+        timer.start()
+
+        def _raise_timeout(exc):
+            LOG.debug('Timed out waiting for RPC response: %s', exc)
+            raise rpc_common.Timeout()
+
         def _error_callback(exc):
-            if isinstance(exc, socket.timeout):
-                LOG.debug('Timed out waiting for RPC response: %s', exc)
-                raise rpc_common.Timeout()
-            else:
-                LOG.exception(_('Failed to consume message from queue: %s'),
-                              exc)
-                self.do_consume = True
+            self.do_consume = True
+            timer.check_return(_raise_timeout, exc)
+            LOG.exception(_('Failed to consume message from queue: %s'),
+                          exc)
 
         def _consume():
             if self.do_consume:
@@ -732,7 +714,19 @@ class Connection(object):
                     queue.consume(nowait=True)
                 queues_tail.consume(nowait=False)
                 self.do_consume = False
-            return self.connection.drain_events(timeout=timeout)
+
+            poll_timeout = (self._poll_timeout if timeout is None
+                            else min(timeout, self._poll_timeout))
+            while True:
+                if self._consume_loop_stopped:
+                    self._consume_loop_stopped = False
+                    raise StopIteration
+
+                try:
+                    return self.connection.drain_events(timeout=poll_timeout)
+                except socket.timeout as exc:
+                    poll_timeout = timer.check_return(
+                        _raise_timeout, exc, maximum=self._poll_timeout)
 
         for iteration in itertools.count(0):
             if limit and iteration >= limit:
@@ -776,7 +770,31 @@ class Connection(object):
 
     def direct_send(self, msg_id, msg):
         """Send a 'direct' message."""
-        self.publisher_send(DirectPublisher, msg_id, msg)
+
+        timer = rpc_common.DecayingTimer(duration=60)
+        timer.start()
+        # NOTE(sileht): retry at least 60sec, after we have a good change
+        # that the caller is really dead too...
+
+        while True:
+            try:
+                self.publisher_send(DirectPublisher, msg_id, msg)
+            except self.connection.channel_errors as exc:
+                # NOTE(noelbk/sileht):
+                # If rabbit dies, the consumer can be disconnected before the
+                # publisher sends, and if the consumer hasn't declared the
+                # queue, the publisher's will send a message to an exchange
+                # that's not bound to a queue, and the message wll be lost.
+                # So we set passive=True to the publisher exchange and catch
+                # the 404 kombu ChannelError and retry until the exchange
+                # appears
+                if exc.code == 404 and timer.check_return() > 0:
+                    LOG.info(_("The exchange to reply to %s doesn't "
+                               "exist yet, retrying...") % msg_id)
+                    time.sleep(1)
+                    continue
+                raise
+            return
 
     def topic_send(self, exchange_name, topic, msg, timeout=None, retry=None):
         """Send a 'topic' message."""
@@ -800,6 +818,9 @@ class Connection(object):
                 six.next(it)
             except StopIteration:
                 return
+
+    def stop_consuming(self):
+        self._consume_loop_stopped = True
 
 
 class RabbitDriver(amqpdriver.AMQPDriverBase):

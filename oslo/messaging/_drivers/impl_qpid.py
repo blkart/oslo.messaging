@@ -460,6 +460,8 @@ class Connection(object):
         self.consumers = {}
         self.conf = conf
 
+        self._consume_loop_stopped = False
+
         self.brokers_params = []
         if url.hosts:
             for host in url.hosts:
@@ -621,20 +623,42 @@ class Connection(object):
     def iterconsume(self, limit=None, timeout=None):
         """Return an iterator that will consume from all queues/consumers."""
 
+        timer = rpc_common.DecayingTimer(duration=timeout)
+        timer.start()
+
+        def _raise_timeout(exc):
+            LOG.debug('Timed out waiting for RPC response: %s', exc)
+            raise rpc_common.Timeout()
+
         def _error_callback(exc):
-            if isinstance(exc, qpid_exceptions.Empty):
-                LOG.debug('Timed out waiting for RPC response: %s', exc)
-                raise rpc_common.Timeout()
-            else:
-                LOG.exception(_('Failed to consume message from queue: %s'),
-                              exc)
+            timer.check_return(_raise_timeout, exc)
+            LOG.exception(_('Failed to consume message from queue: %s'), exc)
 
         def _consume():
-            nxt_receiver = self.session.next_receiver(timeout=timeout)
+            # NOTE(sileht):
+            # maximun value choosen according the best practice from kombu:
+            # http://kombu.readthedocs.org/en/latest/reference/kombu.common.html#kombu.common.eventloop
+            poll_timeout = 1 if timeout is None else min(timeout, 1)
+
+            while True:
+                if self._consume_loop_stopped:
+                    self._consume_loop_stopped = False
+                    raise StopIteration
+
+                try:
+                    nxt_receiver = self.session.next_receiver(
+                        timeout=poll_timeout)
+                except qpid_exceptions.Empty as exc:
+                    poll_timeout = timer.check_return(_raise_timeout, exc,
+                                                      maximum=1)
+                else:
+                    break
+
             try:
                 self._lookup_consumer(nxt_receiver).consume()
             except Exception:
-                LOG.exception(_("Error processing message.  Skipping it."))
+                LOG.exception(_("Error processing message. "
+                                "Skipping it."))
 
         for iteration in itertools.count(0):
             if limit and iteration >= limit:
@@ -712,6 +736,9 @@ class Connection(object):
                 six.next(it)
             except StopIteration:
                 return
+
+    def stop_consuming(self):
+        self._consume_loop_stopped = True
 
 
 class QpidDriver(amqpdriver.AMQPDriverBase):
