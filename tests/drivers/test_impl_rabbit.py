@@ -21,12 +21,14 @@ import uuid
 
 import fixtures
 import kombu
+import kombu.transport.memory
 import mock
 from oslotest import mockpatch
 import testscenarios
 
 from oslo.config import cfg
 from oslo import messaging
+from oslo.messaging._drivers import amqp
 from oslo.messaging._drivers import amqpdriver
 from oslo.messaging._drivers import common as driver_common
 from oslo.messaging._drivers import impl_rabbit as rabbit_driver
@@ -45,6 +47,7 @@ class TestDeprecatedRabbitDriverLoad(test_utils.BaseTestCase):
         self.config(fake_rabbit=True)
 
     def test_driver_load(self):
+        self.config(heartbeat_timeout_threshold=0)
         transport = messaging.get_transport(self.conf)
         self.addCleanup(transport.cleanup)
         driver = transport._driver
@@ -52,6 +55,58 @@ class TestDeprecatedRabbitDriverLoad(test_utils.BaseTestCase):
 
         self.assertIsInstance(driver, rabbit_driver.RabbitDriver)
         self.assertEqual('memory:////', url)
+
+
+class TestHeartbeat(test_utils.BaseTestCase):
+
+    @mock.patch('oslo.messaging._drivers.impl_rabbit.LOG')
+    @mock.patch('kombu.connection.Connection.heartbeat_check')
+    @mock.patch('oslo.messaging._drivers.impl_rabbit.Connection.'
+                '_heartbeat_supported_and_enabled', return_value=True)
+    @mock.patch('oslo.messaging._drivers.impl_rabbit.Connection.'
+                'ensure_connection')
+    def _do_test_heartbeat_sent(self, fake_ensure_connection,
+                                fake_heartbeat_support, fake_heartbeat,
+                                fake_logger, heartbeat_side_effect=None,
+                                info=None):
+
+        event = threading.Event()
+
+        def heartbeat_check(rate=2):
+            event.set()
+            if heartbeat_side_effect:
+                raise heartbeat_side_effect
+
+        fake_heartbeat.side_effect = heartbeat_check
+
+        transport = messaging.get_transport(self.conf,
+                                            'kombu+memory:////')
+        self.addCleanup(transport.cleanup)
+        conn = transport._driver._get_connection()
+        conn.ensure(error_callback=None, method=lambda: True)
+        event.wait()
+        conn._heartbeat_stop()
+
+        # check heartbeat have been called
+        self.assertLess(0, fake_heartbeat.call_count)
+
+        if not heartbeat_side_effect:
+            self.assertEqual(1, fake_ensure_connection.call_count)
+            self.assertEqual(2, fake_logger.info.call_count)
+        else:
+            self.assertEqual(2, fake_ensure_connection.call_count)
+            self.assertEqual(3, fake_logger.info.call_count)
+            self.assertIn(mock.call(info, mock.ANY),
+                          fake_logger.info.mock_calls)
+
+    def test_test_heartbeat_sent_default(self):
+        self._do_test_heartbeat_sent()
+
+    def test_test_heartbeat_sent_connection_fail(self):
+        self._do_test_heartbeat_sent(
+            heartbeat_side_effect=kombu.exceptions.ConnectionError,
+            info='A recoverable connection/channel error occurs, '
+            'try to reconnect: %s')
 
 
 class TestRabbitDriverLoad(test_utils.BaseTestCase):
@@ -63,6 +118,7 @@ class TestRabbitDriverLoad(test_utils.BaseTestCase):
     @mock.patch('oslo.messaging._drivers.impl_rabbit.Connection.ensure')
     @mock.patch('oslo.messaging._drivers.impl_rabbit.Connection.reset')
     def test_driver_load(self, fake_ensure, fake_reset):
+        self.config(heartbeat_timeout_threshold=0)
         transport = messaging.get_transport(self.conf)
         self.addCleanup(transport.cleanup)
         self.assertIsInstance(transport._driver, rabbit_driver.RabbitDriver)
@@ -97,8 +153,8 @@ class TestRabbitDriverLoadSSL(test_utils.BaseTestCase):
 
         transport._driver._get_connection()
         connection_klass.assert_called_once_with(
-            'memory:///', ssl=self.expected,
-            login_method='AMQPLAIN', failover_strategy="shuffle")
+            'memory:///', ssl=self.expected, login_method='AMQPLAIN',
+            heartbeat=60, failover_strategy="shuffle")
 
 
 class TestRabbitIterconsume(test_utils.BaseTestCase):
@@ -107,7 +163,7 @@ class TestRabbitIterconsume(test_utils.BaseTestCase):
         transport = messaging.get_transport(self.conf, 'kombu+memory:////')
         self.addCleanup(transport.cleanup)
         deadline = time.time() + 3
-        with transport._driver._get_connection() as conn:
+        with transport._driver._get_connection(amqp.PURPOSE_LISTEN) as conn:
             conn.iterconsume(timeout=3)
             # kombu memory transport doesn't really raise error
             # so just simulate a real driver behavior
@@ -121,6 +177,36 @@ class TestRabbitIterconsume(test_utils.BaseTestCase):
                     pass
 
         self.assertEqual(0, int(deadline - time.time()))
+
+    def test_connection_reset_always_succeed(self):
+        transport = messaging.get_transport(self.conf,
+                                            'kombu+memory:////')
+        self.addCleanup(transport.cleanup)
+        channel = mock.Mock()
+        conn = transport._driver._get_connection(amqp.PURPOSE_LISTEN
+                                                 ).connection
+        conn.connection.recoverable_channel_errors = (IOError,)
+        with mock.patch.object(conn.connection, 'channel',
+                               side_effect=[IOError, IOError, channel]):
+            conn.reset()
+            self.assertEqual(channel, conn.channel)
+
+
+class TestRabbitConsume(test_utils.BaseTestCase):
+
+    def test_connection_ack_have_disconnected_kombu_connection(self):
+        transport = messaging.get_transport(self.conf,
+                                            'kombu+memory:////')
+        self.addCleanup(transport.cleanup)
+        conn = transport._driver._get_connection().connection
+        channel = conn.channel
+        with mock.patch('kombu.connection.Connection.connected',
+                        new_callable=mock.PropertyMock,
+                        return_value=False):
+            self.assertRaises(driver_common.Timeout,
+                              conn.consume, timeout=0.01)
+            # Ensure a new channel have been setuped
+            self.assertNotEqual(channel, conn.channel)
 
 
 class TestRabbitTransportURL(test_utils.BaseTestCase):
@@ -158,6 +244,7 @@ class TestRabbitTransportURL(test_utils.BaseTestCase):
 
     def setUp(self):
         super(TestRabbitTransportURL, self).setUp()
+        self.config(heartbeat_timeout_threshold=0)
         self.messaging_conf.transport_driver = 'rabbit'
 
     @mock.patch('oslo.messaging._drivers.impl_rabbit.Connection.ensure')
@@ -212,6 +299,7 @@ class TestSendReceive(test_utils.BaseTestCase):
                                                          cls._timeout)
 
     def test_send_receive(self):
+        self.config(heartbeat_timeout_threshold=0)
         transport = messaging.get_transport(self.conf, 'kombu+memory:////')
         self.addCleanup(transport.cleanup)
 
@@ -718,7 +806,8 @@ class RpcKombuHATestCase(test_utils.BaseTestCase):
 
         # starting from the first broker in the list
         url = messaging.TransportURL.parse(self.conf, None)
-        self.connection = rabbit_driver.Connection(self.conf, url)
+        self.connection = rabbit_driver.Connection(self.conf, url,
+                                                   amqp.PURPOSE_SEND)
         self.addCleanup(self.connection.close)
 
     def test_ensure_four_retry(self):
