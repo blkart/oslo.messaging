@@ -883,6 +883,9 @@ class Connection(object):
 
                 try:
                     try:
+                        if not self.connection.connected:
+                            raise self.connection.recoverable_connection_errors[0]
+
                         self.connection.heartbeat_check(
                             rate=self.conf.heartbeat_rate)
                         # NOTE(sileht): We need to drain event to receive
