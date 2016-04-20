@@ -1044,7 +1044,10 @@ class Connection(object):
     def direct_send(self, msg_id, msg):
         """Send a 'direct' message."""
 
-        timer = rpc_common.DecayingTimer(duration=60)
+        duration = 60
+        amqp_notfound_count = 0
+        last_amqp_notfound_time = 0
+        timer = rpc_common.DecayingTimer(duration)
         timer.start()
         # NOTE(sileht): retry at least 60sec, after we have a good change
         # that the caller is really dead too...
@@ -1062,10 +1065,25 @@ class Connection(object):
                 # the 404 kombu ChannelError and retry until the exchange
                 # appears
                 if exc.code == 404 and timer.check_return() > 0:
-                    LOG.info(_("The exchange to reply to %s doesn't "
-                               "exist yet, retrying...") % msg_id)
-                    time.sleep(1)
+                    current_time = time.time()
+                    amqp_notfound_count += 1
+                    msg = _("The exchange to reply to %s doesn't "
+                            "exist for %s times, retrying...") % (
+                            msg_id, amqp_notfound_count)
+                    if amqp_notfound_count == 1 or\
+                            current_time - last_amqp_notfound_time >= 20:
+                        LOG.info(msg)
+                        last_amqp_notfound_time = current_time
+                    time.sleep(0.25)
                     continue
+                elif exc.code == 404:
+                    msg = _("The exchange to reply to "
+                            "%(routing_key)s still doesn't exist after "
+                            "%(duration)s sec abandonning...") % {
+                                'duration': duration,
+                                'routing_key': msg_id}
+                    LOG.error(msg)
+                    raise rpc_amqp.AMQPDestinationNotFound(msg)
                 raise
             return
 
