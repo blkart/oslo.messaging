@@ -17,6 +17,7 @@ __all__ = ['AMQPDriverBase']
 
 import logging
 import threading
+import time
 import uuid
 
 import cachetools
@@ -60,16 +61,19 @@ class AMQPIncomingMessage(base.IncomingMessage):
             msg['ending'] = True
 
         rpc_amqp._add_unique_id(msg)
+        unique_id = msg[rpc_amqp.UNIQUE_ID]
 
         # If a reply_q exists, add the msg_id to the reply and pass the
         # reply_q to direct_send() to use it as the response queue.
         # Otherwise use the msg_id for backward compatibility.
         if self.reply_q:
             msg['_msg_id'] = self.msg_id
-            try:
-                conn.direct_send(self.reply_q, rpc_common.serialize_msg(msg))
-            except rpc_amqp.AMQPDestinationNotFound:
-                self._obsolete_reply_queues.add(self.reply_q, self.msg_id)
+            LOG.debug("sending reply msg_id: %(msg_id)s "
+                      "reply queue: %(reply_q)s" % {
+                          'msg_id': self.msg_id,
+                          'unique_id': unique_id,
+                          'reply_q': self.reply_q})
+            conn.direct_send(self.reply_q, rpc_common.serialize_msg(msg))
         else:
             # TODO(sileht): look at which version of oslo-incubator rpc
             # send need this, but I guess this is older than icehouse
@@ -83,16 +87,52 @@ class AMQPIncomingMessage(base.IncomingMessage):
             #    because reply should not be expected by caller side
             return
 
-        # NOTE(sileht): return without hold the a connection if possible
+        # NOTE(sileht): return without using a connection if possible
         if (self.reply_q and
             not self._obsolete_reply_queues.reply_q_valid(self.reply_q,
                                                           self.msg_id)):
             return
 
-        with self.listener.driver._get_connection(
-                rpc_amqp.PURPOSE_SEND) as conn:
-            self._send_reply(conn, reply, failure, log_failure=log_failure)
-            self._send_reply(conn, ending=True)
+        duration = 60
+        amqp_notfound_count = 0
+        last_amqp_notfound_time = 0
+        timer = rpc_common.DecayingTimer(duration=duration)
+        timer.start()
+
+        while True:
+            try:
+                with self.listener.driver._get_connection(
+                        rpc_amqp.PURPOSE_SEND) as conn:
+                    self._send_reply(conn, reply, failure,
+                                     log_failure=log_failure)
+                    self._send_reply(conn, ending=True)
+                return
+            except rpc_amqp.AMQPDestinationNotFound:
+                if timer.check_return() > 0:
+                    current_time = time.time()
+                    amqp_notfound_count += 1
+                    msg = _("The reply %(msg_id)s cannot be sent, "
+                            "reply queue %(reply_q)s doesn't exist "
+                            "after retried %(times)s times, keep retrying...") % {
+                                'msg_id': self.msg_id,
+                                'reply_q': self.reply_q,
+                                'times': amqp_notfound_count}
+                    if amqp_notfound_count == 1 or\
+                            current_time - last_amqp_notfound_time >= 20:
+                        LOG.info(msg)
+                        last_amqp_notfound_time = current_time
+                    time.sleep(0.25)
+                    continue
+                else:
+                    self._obsolete_reply_queues.add(self.reply_q, self.msg_id)
+                    msg = _("The reply %(msg_id)s cannot be sent, "
+                            "reply queue %(reply_q)s doesn't exist after "
+                            "%(duration)s sec abandoning...") % {
+                                'msg_id': self.msg_id,
+                                'reply_q': self.reply_q,
+                                'duration': duration}
+                    LOG.error(msg)
+                    return
 
     def acknowledge(self):
         self.listener.msg_id_cache.add(self.unique_id)

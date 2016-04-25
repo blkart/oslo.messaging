@@ -1044,18 +1044,10 @@ class Connection(object):
     def direct_send(self, msg_id, msg):
         """Send a 'direct' message."""
 
-        duration = 60
-        amqp_notfound_count = 0
-        last_amqp_notfound_time = 0
-        timer = rpc_common.DecayingTimer(duration)
-        timer.start()
-        # NOTE(sileht): retry at least 60sec, after we have a good change
-        # that the caller is really dead too...
-
-        while True:
-            try:
-                self.publisher_send(DirectPublisher, msg_id, msg)
-            except self.connection.channel_errors as exc:
+        try:
+            self.publisher_send(DirectPublisher, msg_id, msg)
+        except self.connection.channel_errors as exc:
+            if exc.code == 404:
                 # NOTE(noelbk/sileht):
                 # If rabbit dies, the consumer can be disconnected before the
                 # publisher sends, and if the consumer hasn't declared the
@@ -1064,28 +1056,9 @@ class Connection(object):
                 # So we set passive=True to the publisher exchange and catch
                 # the 404 kombu ChannelError and retry until the exchange
                 # appears
-                if exc.code == 404 and timer.check_return() > 0:
-                    current_time = time.time()
-                    amqp_notfound_count += 1
-                    msg = _("The exchange to reply to %s doesn't "
-                            "exist for %s times, retrying...") % (
-                            msg_id, amqp_notfound_count)
-                    if amqp_notfound_count == 1 or\
-                            current_time - last_amqp_notfound_time >= 20:
-                        LOG.info(msg)
-                        last_amqp_notfound_time = current_time
-                    time.sleep(0.25)
-                    continue
-                elif exc.code == 404:
-                    msg = _("The exchange to reply to "
-                            "%(routing_key)s still doesn't exist after "
-                            "%(duration)s sec abandonning...") % {
-                                'duration': duration,
-                                'routing_key': msg_id}
-                    LOG.error(msg)
-                    raise rpc_amqp.AMQPDestinationNotFound(msg)
-                raise
-            return
+                raise rpc_amqp.AMQPDestinationNotFound(
+                    "exchange %s doesn't exits" % msg_id)
+            raise
 
     def topic_send(self, exchange_name, topic, msg, timeout=None, retry=None):
         """Send a 'topic' message."""
